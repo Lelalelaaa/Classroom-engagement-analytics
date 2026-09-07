@@ -1,3 +1,5 @@
+import type { RatingConfidence, SegmentRating } from './types';
+
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
@@ -33,4 +35,19 @@ export const api = {
 
   getClassroomsSummary: () =>
     apiFetch('/api/analytics/classrooms/summary'),
+
+  // Model feedback
+  submitRatings: (body: {
+    session_id: string;
+    segments: {
+      segment_start_s: number;
+      segment_end_s: number;
+      rating: SegmentRating;
+      confidence: RatingConfidence;
+      note: string;
+    }[];
+  }) => apiFetch<{ saved: string; segments: number }>('/api/eval/ratings', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
 };

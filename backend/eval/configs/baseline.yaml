@@ -1,0 +1,11 @@
+# Starting thresholds. Every value here is an assumption until sweep.py has
+# been run against annotated footage — see the TODOs in app/config.py.
+yaw_enter_deg: 25.0
+yaw_exit_deg: 32.0
+desk_work_pitch_deg: 18.0
+desk_work_weight: 1.0
+ema_alpha: 0.4
+window_seconds: 20.0
+gaze_blend_weight: 0.3
+min_face_px: 24
+min_face_px_for_gaze: 80

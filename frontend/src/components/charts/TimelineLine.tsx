@@ -5,7 +5,9 @@ import {
 } from 'recharts';
 import { LiveMetrics } from '@/lib/types';
 
-interface Props { data: LiveMetrics[] }
+type TimelineDataPoint = LiveMetrics | { time: number; engagement: number };
+
+interface Props { data: TimelineDataPoint[] }
 
 export function TimelineLine({ data }: Props) {
   if (data.length === 0) {
@@ -16,10 +18,12 @@ export function TimelineLine({ data }: Props) {
     );
   }
 
+  const isLiveMetrics = (d: TimelineDataPoint): d is LiveMetrics =>
+    'class_engagement' in d;
+
   const chartData = data.map((m, i) => ({
     index:      i,
-    engagement: m.class_engagement,
-    yawn:       m.yawn_rate,
+    engagement: isLiveMetrics(m) ? m.class_engagement : m.engagement,
   }));
 
   return (
@@ -30,18 +34,13 @@ export function TimelineLine({ data }: Props) {
         <YAxis domain={[0, 100]} stroke="#4b5563" tick={{ fill: '#6b7280', fontSize: 11 }} unit="%" />
         <Tooltip
           contentStyle={{ backgroundColor: '#111827', border: '1px solid #1f2937', borderRadius: 8 }}
-          formatter={(v: number, name: string) => [`${v.toFixed(1)}%`, name === 'engagement' ? 'Engagement' : 'Yawn Rate']}
+          formatter={(v: number) => [`${v.toFixed(1)}%`, 'Engagement']}
         />
         <ReferenceLine y={50} stroke="#ef4444" strokeDasharray="4 4" strokeOpacity={0.5} />
         <Line
           type="monotone" dataKey="engagement"
           stroke="#6366f1" strokeWidth={2} dot={false}
           activeDot={{ r: 4, fill: '#6366f1' }}
-        />
-        <Line
-          type="monotone" dataKey="yawn"
-          stroke="#f59e0b" strokeWidth={1.5} dot={false} strokeDasharray="4 4"
-          activeDot={{ r: 3, fill: '#f59e0b' }}
         />
       </LineChart>
     </ResponsiveContainer>

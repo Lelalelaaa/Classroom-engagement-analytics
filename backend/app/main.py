@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from .config import settings
-from .api.routes import sessions, classrooms, analytics
+from .api.routes import sessions, classrooms, analytics, feedback
 from .api.websocket import video_receiver, dashboard_push
 from .services.redis_service import init_redis, close_redis
 from .db.database import init_db
@@ -37,6 +37,7 @@ app.add_middleware(
 app.include_router(sessions.router,   prefix="/api/sessions",   tags=["Sessions"])
 app.include_router(classrooms.router, prefix="/api/classrooms", tags=["Classrooms"])
 app.include_router(analytics.router,  prefix="/api/analytics",  tags=["Analytics"])
+app.include_router(feedback.router,   prefix="/api/eval",       tags=["Eval"])
 
 # WebSocket routers
 app.include_router(video_receiver.router)

@@ -1,239 +1,300 @@
 """
-Full AI pipeline orchestrator.
-Uses:
-  - yakhyo/gaze-estimation  (ONNX) for gaze yaw/pitch angles
-  - FER+ ONNX               for emotion classification
-  - MediaPipe FaceLandmarker for yawn detection (mouth aspect ratio)
-  - OpenCV Haarcascade      for fast face bounding box detection
+Gaze-only pipeline orchestrator.
+
+    YuNet (full frame)  →  per-face crop  →  MediaPipe FaceLandmarker
+                                          →  head pose (transformation matrix)
+                                          →  eye gaze ONNX  [above pixel gate,
+                                                             round-robin budget]
+                                          →  tracker  →  AttentionEngine
+
+One detector, one face list. The previous version ran Haar and MediaPipe
+independently and then indexed one list with the other's index, which
+attributed measurements to the wrong students whenever the two disagreed.
+
+Heavy models are process-wide singletons; per-session state (tracker,
+attention engine, gaze scheduling) lives on the instance, so one
+FrameDistributor is created per session rather than shared across them.
+
+PRIVACY: frames exist only as numpy arrays in RAM and are released when this
+returns. Nothing per-student that could follow a person across the session —
+no track ids — crosses into the payload; the overlay carries this frame's
+geometry and nothing else.
 """
 import asyncio
 import logging
-import numpy as np
-import cv2
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 from dataclasses import dataclass, field
+from typing import Optional
 
+import numpy as np
+
+from ..config import settings
+from .engagement_engine import AttentionConfig, AttentionEngine, AttentionState
+from .head_pose import HeadPose, angular_deviation, pose_from_matrix
 from .mediapipe_init import FacePipelineConfig
-from .yawn_detector import YawnResult, detect_yawn
-from .engagement_engine import FaceEngagementState, compute_engagement
+from .tracker import FaceTracker
+from .yunet_detector import FaceDetection, YuNetDetector
 
-logger   = logging.getLogger(__name__)
-executor = ThreadPoolExecutor(max_workers=4)
+logger = logging.getLogger(__name__)
+executor = ThreadPoolExecutor(max_workers=settings.PIPELINE_WORKERS)
 
-# Lazy-load the ONNX models so server starts even if weights are missing
-_gaze_model    = None
-_emotion_model = None
-_face_cascade  = None
+_detector: Optional[YuNetDetector] = None
+_gaze_model = None
+_gaze_load_failed = False
+_mp_pipeline: Optional[FacePipelineConfig] = None
+
+# The worker pool hits these loaders concurrently on the first frame. Without
+# the lock every worker sees `None` and builds its own copy — four MediaPipe
+# pipelines, each with its own GL context, three of them then discarded.
+_model_lock = threading.Lock()
+
+
+def _get_detector() -> YuNetDetector:
+    global _detector
+    if _detector is not None:
+        return _detector
+    with _model_lock:
+        if _detector is not None:
+            return _detector
+        _detector = YuNetDetector(
+            settings.YUNET_MODEL_PATH,
+            score_threshold=settings.YUNET_SCORE_THRESHOLD,
+            nms_threshold=settings.YUNET_NMS_THRESHOLD,
+            tiling=settings.DETECT_TILING,
+            tile_overlap=settings.DETECT_TILE_OVERLAP,
+        )
+        return _detector
+
+
+def _get_mp_pipeline() -> FacePipelineConfig:
+    global _mp_pipeline
+    if _mp_pipeline is not None:
+        return _mp_pipeline
+    with _model_lock:
+        if _mp_pipeline is None:
+            _mp_pipeline = FacePipelineConfig(
+                max_faces=settings.MAX_FACES_PER_CAMERA,
+                crop_pool_size=settings.PIPELINE_WORKERS,
+            )
+        return _mp_pipeline
 
 
 def _get_gaze_model():
-    global _gaze_model
-    if _gaze_model is None:
+    """
+    Load the eye-gaze model once. A failure is cached rather than retried:
+    the previous version re-attempted the load for every face of every frame.
+    """
+    global _gaze_model, _gaze_load_failed
+    if _gaze_model is not None or _gaze_load_failed:
+        return _gaze_model
+    with _model_lock:
+        if _gaze_model is not None or _gaze_load_failed:
+            return _gaze_model
         try:
             from .gaze_onnx import GazeEstimatorONNX
-            _gaze_model = GazeEstimatorONNX()
-        except Exception as e:
-            logger.warning(f"[pipeline] Gaze ONNX not available: {e}")
-    return _gaze_model
+            _gaze_model = GazeEstimatorONNX(
+                backbone=settings.GAZE_BACKBONE,
+                margin=settings.GAZE_CROP_MARGIN,
+                intra_op_threads=settings.ONNX_INTRA_OP_THREADS,
+            )
+        except Exception as exc:
+            _gaze_load_failed = True
+            logger.warning(
+                "[pipeline] eye-gaze model unavailable (%s). Running on head pose only — "
+                "students are NOT silently scored as engaged.", exc
+            )
+        return _gaze_model
 
-
-def _get_emotion_model():
-    global _emotion_model
-    if _emotion_model is None:
-        try:
-            from .emotion_onnx import EmotionClassifierONNX
-            _emotion_model = EmotionClassifierONNX()
-        except Exception as e:
-            logger.warning(f"[pipeline] Emotion ONNX not available: {e}")
-    return _emotion_model
-
-
-def _get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        _face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-    return _face_cascade
-
-
-# ── Per-face result (includes spatial data for frontend overlay) ─────────────
 
 @dataclass
-class FaceEngagementState:
-    face_id:         int
-    gaze_score:      float
-    emotion_score:   float
-    yawn_score:      float
-    composite_score: float
-    is_engaged:      bool
-    # Overlay data (normalised 0–1 coordinates)
-    bbox_norm:       list = field(default_factory=list)   # [x, y, w, h]
-    yaw:             float = 0.0
-    pitch:           float = 0.0
-    emotion_label:   str   = "neutral"
-    gaze_label:      str   = "Looking Forward"
+class FaceObservation:
+    """One student's measurement for one frame, in normalised overlay terms."""
+    bbox_norm: list[float]
+    face_px: int
+    state: AttentionState
+    yaw_dev: float = 0.0
+    pitch_dev: float = 0.0
+    on_task_ratio: Optional[float] = None
+    has_gaze: bool = False
 
 
 class FrameDistributor:
-    """
-    Orchestrates the full AI pipeline for a single video frame.
-    All processing is in-memory — no frames are written to disk.
-    """
+    """Runs the pipeline for one session. Not shared between sessions."""
 
-    def __init__(self, max_faces: int = 35):
-        self.mp_pipeline   = FacePipelineConfig(max_faces=max_faces)
-        self._emotion_cache: dict[int, object] = {}
-        self._gaze_cache:   dict[int, object]  = {}
-
-    async def process_frame(self, frame_bgr: np.ndarray) -> list[FaceEngagementState]:
-        loop   = asyncio.get_running_loop()
-        h, w   = frame_bgr.shape[:2]
-
-        # ── Step 1: Face detection (OpenCV Haarcascade — fast) ────────────────
-        gray   = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        cascade = _get_face_cascade()
-        raw_faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-
-        if not len(raw_faces):
-            return []
-
-        # ── Step 2: MediaPipe for yawn landmarks ──────────────────────────────
-        mp_results = await loop.run_in_executor(
-            executor, self.mp_pipeline.process_frame, frame_bgr
+    def __init__(self, max_faces: int = 40, config: Optional[AttentionConfig] = None):
+        self.max_faces = max_faces
+        self.config = config or AttentionConfig.from_settings(settings)
+        self.engine = AttentionEngine(self.config)
+        self.tracker = FaceTracker(
+            iou_threshold=settings.TRACK_IOU_THRESHOLD,
+            max_lost_frames=settings.TRACK_MAX_LOST_FRAMES,
         )
-        mp_landmarks = mp_results.multi_face_landmarks or []
+        self._gaze_cache: dict[int, tuple[float, float]] = {}
+        self._gaze_seen_at: dict[int, int] = {}
+        self._frame_index = 0
 
-        # ── Step 3: Per-face gaze + emotion (parallel) ───────────────────────
-        states: list[FaceEngagementState] = []
-        for face_id, (fx, fy, fw, fh) in enumerate(raw_faces):
-            # Normalised bbox for frontend overlay
-            bbox_norm = [fx / w, fy / h, fw / w, fh / h]
+    def start_calibration(self, now: float) -> None:
+        self.engine.start_calibration(now)
 
-            # Crop face
-            x1, y1 = max(0, fx), max(0, fy)
-            x2, y2 = min(w, fx + fw), min(h, fy + fh)
-            face_crop = frame_bgr[y1:y2, x1:x2]
-            if face_crop.size == 0:
-                continue
+    def finish_calibration(self) -> int:
+        return self.engine.finish_calibration()
 
-            # Gaze (ONNX — yakhyo model)
-            try:
-                gaze_res = await loop.run_in_executor(
-                    executor, self._run_gaze, face_id, face_crop
-                )
-            except Exception as e:
-                logger.warning(f"[pipeline] gaze error face {face_id}: {e}")
-                gaze_res = None
+    async def process_frame(self, frame_bgr: np.ndarray, now: float) -> list[FaceObservation]:
+        loop = asyncio.get_running_loop()
+        h, w = frame_bgr.shape[:2]
+        self._frame_index += 1
 
-            # Emotion (ONNX — FER+)
-            try:
-                em_res = await loop.run_in_executor(
-                    executor, self._run_emotion, face_id, face_crop
-                )
-            except Exception as e:
-                logger.warning(f"[pipeline] emotion error face {face_id}: {e}")
-                em_res = None
+        detections = await loop.run_in_executor(executor, _get_detector().detect, frame_bgr)
+        if not detections:
+            return []
+        detections = sorted(detections, key=lambda d: d.score, reverse=True)[: self.max_faces]
 
-            # Yawn (MediaPipe landmarks — match closest face)
-            yawn_res = self._match_yawn(face_id, mp_landmarks, w, h, fx, fy, fw, fh)
+        tracked = self.tracker.update(detections)
+        gaze_targets = self._select_gaze_targets(tracked)
 
-            # Engagement score
-            g_score  = (gaze_res.is_looking_at_screen if gaze_res else True)
-            em_score = (em_res.valence if em_res else self._emotion_cache.get(face_id, 0.6) if not isinstance(self._emotion_cache.get(face_id), object) else 0.6)
-            if em_res:
-                em_score = em_res.valence
-                self._emotion_cache[face_id] = em_res
-            else:
-                cached = self._emotion_cache.get(face_id)
-                em_score = cached.valence if cached else 0.6
+        results = await asyncio.gather(*[
+            loop.run_in_executor(
+                executor, self._analyse_face, frame_bgr, det, track_id in gaze_targets
+            )
+            for track_id, det in tracked
+        ])
 
-            y_score   = 0.0 if (yawn_res and yawn_res.is_yawning) else 1.0
-            composite = round(0.5 * (1.0 if g_score else 0.0) + 0.3 * em_score + 0.2 * y_score, 3)
+        observations: list[FaceObservation] = []
+        for (track_id, det), (pose, gaze) in zip(tracked, results):
+            if gaze is not None:
+                self._gaze_cache[track_id] = gaze
+                self._gaze_seen_at[track_id] = self._frame_index
+            blended_gaze = self._gaze_cache.get(track_id)
 
-            states.append(FaceEngagementState(
-                face_id=face_id,
-                gaze_score=1.0 if g_score else 0.0,
-                emotion_score=em_score,
-                yawn_score=y_score,
-                composite_score=composite,
-                is_engaged=composite >= 0.5,
-                bbox_norm=bbox_norm,
-                yaw=gaze_res.yaw if gaze_res else 0.0,
-                pitch=gaze_res.pitch if gaze_res else 0.0,
-                emotion_label=em_res.dominant_emotion if em_res else "neutral",
-                gaze_label=gaze_res.label if gaze_res else "👀 Looking Forward",
+            student = self.engine.observe(
+                track_id=track_id,
+                now=now,
+                head_pose=pose,
+                gaze=blended_gaze,
+                face_px=det.size_px,
+            )
+
+            yaw_dev, pitch_dev = self._deviation(student, pose)
+            observations.append(FaceObservation(
+                bbox_norm=det.bbox_norm(w, h),
+                face_px=det.size_px,
+                state=student.state,
+                yaw_dev=round(yaw_dev, 1),
+                pitch_dev=round(pitch_dev, 1),
+                on_task_ratio=student.on_task_ratio(
+                    now, self.config.window_seconds, self.config.desk_work_weight
+                ),
+                has_gaze=blended_gaze is not None,
             ))
 
-        return states
+        self._forget_dropped_tracks()
+        return observations
 
-    def _run_gaze(self, face_id: int, face_crop: np.ndarray):
-        model = _get_gaze_model()
-        if model is None:
-            return None
-        result = model.estimate(face_crop)
-        self._gaze_cache[face_id] = result
-        return result
+    def _deviation(self, student, pose: Optional[HeadPose]) -> tuple[float, float]:
+        """Angles shown on the overlay are relative to the student's reference."""
+        if pose is None:
+            return 0.0, 0.0
+        reference = student.reference
+        if reference is None:
+            return pose.yaw, pose.pitch
+        smoothed = HeadPose(
+            yaw=student.ema_yaw if student.ema_yaw is not None else pose.yaw,
+            pitch=student.ema_pitch if student.ema_pitch is not None else pose.pitch,
+            roll=0.0,
+        )
+        return angular_deviation(smoothed, reference)
 
-    def _run_emotion(self, face_id: int, face_crop: np.ndarray):
-        model = _get_emotion_model()
-        if model is None:
-            return None
-        result = model.classify(face_crop)
-        if result:
-            self._emotion_cache[face_id] = result
-        return result or self._emotion_cache.get(face_id)
+    def _select_gaze_targets(self, tracked: list[tuple[int, FaceDetection]]) -> set[int]:
+        """
+        Choose which faces get an eye-gaze pass this frame.
 
-    def _match_yawn(self, face_id, mp_landmarks, w, h, fx, fy, fw, fh) -> Optional[YawnResult]:
-        """Match the closest MediaPipe landmark set to the haarcascade face bbox."""
-        if face_id < len(mp_landmarks):
-            return detect_yawn(mp_landmarks[face_id], w, h)
+        Eye gaze refines an EMA-smoothed signal read over a multi-second
+        window, so every student does not need it every frame. Refreshing the
+        stalest few keeps per-frame cost flat as the class grows — a 40-student
+        room costs the same as a 10-student one — instead of making throughput
+        a function of attendance.
+        """
+        if _get_gaze_model() is None:
+            return set()
+        eligible = [
+            track_id for track_id, det in tracked
+            if det.size_px >= self.config.min_face_px_for_gaze
+        ]
+        eligible.sort(key=lambda t: self._gaze_seen_at.get(t, -1))
+        return set(eligible[: settings.GAZE_REFRESH_BUDGET])
+
+    def _analyse_face(
+        self, frame_bgr: np.ndarray, det: FaceDetection, want_gaze: bool
+    ) -> tuple[Optional[HeadPose], Optional[tuple[float, float]]]:
+        """Runs on a worker thread: head pose always, eye gaze only when budgeted."""
+        pose = None
+        try:
+            crop = _crop_with_margin(frame_bgr, det, margin=0.15)
+            if crop is not None:
+                result = _get_mp_pipeline().process_crop(crop)
+                if result.facial_transformation_matrixes:
+                    pose = pose_from_matrix(result.facial_transformation_matrixes[0])
+        except Exception as exc:
+            logger.debug("[pipeline] head pose failed: %s", exc)
+
+        gaze = None
+        if want_gaze:
+            try:
+                model = _get_gaze_model()
+                if model is not None:
+                    result = model.estimate(frame_bgr, det)
+                    if result is not None:
+                        gaze = (result.yaw, result.pitch)
+            except Exception as exc:
+                logger.debug("[pipeline] eye gaze failed: %s", exc)
+
+        return pose, gaze
+
+    def _forget_dropped_tracks(self) -> None:
+        live = set(self.engine.students) & set(self.tracker._tracks)
+        for track_id in list(self._gaze_cache):
+            if track_id not in live:
+                self._gaze_cache.pop(track_id, None)
+                self._gaze_seen_at.pop(track_id, None)
+        for track_id in list(self.engine.students):
+            if track_id not in self.tracker._tracks:
+                self.engine.drop(track_id)
+
+    def aggregate_class_metrics(
+        self, observations: list[FaceObservation], now: float, expected_count: Optional[int] = None
+    ) -> dict:
+        """
+        Build the payload that crosses the privacy boundary.
+
+        Everything here is either a class-level aggregate or this frame's
+        geometry. No identifier, and nothing that links a box in one frame to a
+        box in the next.
+        """
+        metrics = self.engine.class_metrics(now, expected_count=expected_count)
+        metrics["faces"] = [
+            {
+                "bbox":          o.bbox_norm,
+                "yaw":           o.yaw_dev,
+                "pitch":         o.pitch_dev,
+                "state":         o.state.value,
+                "on_task_ratio": None if o.on_task_ratio is None else round(o.on_task_ratio, 3),
+                "measured":      o.state.is_measured,
+                "has_gaze":      o.has_gaze,
+            }
+            for o in observations
+        ]
+        metrics["detected_count"] = len(observations)
+        metrics["gaze_model_loaded"] = _gaze_model is not None
+        return metrics
+
+
+def _crop_with_margin(frame_bgr: np.ndarray, det: FaceDetection, margin: float) -> Optional[np.ndarray]:
+    h, w = frame_bgr.shape[:2]
+    mx, my = int(det.w * margin), int(det.h * margin)
+    x1, y1 = max(0, det.x - mx), max(0, det.y - my)
+    x2, y2 = min(w, det.x + det.w + mx), min(h, det.y + det.h + my)
+    if x2 - x1 < 2 or y2 - y1 < 2:
         return None
-
-
-def aggregate_class_metrics(states: list[FaceEngagementState]) -> dict:
-    """
-    Aggregate per-face states into anonymous class-level metrics.
-    Also includes per-face spatial data for the frontend overlay.
-    """
-    if not states:
-        return {
-            "student_count":        0,
-            "class_engagement":     0.0,
-            "engaged_count":        0,
-            "yawn_rate":            0.0,
-            "emotion_distribution": {},
-            "faces":                [],
-        }
-
-    n              = len(states)
-    avg_engagement = sum(s.composite_score for s in states) / n
-    yawn_rate      = sum(1 for s in states if s.yawn_score == 0.0) / n
-
-    emotion_counts: dict[str, int] = {}
-    for s in states:
-        emotion_counts[s.emotion_label] = emotion_counts.get(s.emotion_label, 0) + 1
-
-    # Per-face data for camera overlay (no identifiers — geometry only)
-    faces_overlay = [
-        {
-            "bbox":    s.bbox_norm,
-            "yaw":     s.yaw,
-            "pitch":   s.pitch,
-            "emotion": s.emotion_label,
-            "gaze":    s.gaze_label,
-            "engaged": s.is_engaged,
-            "score":   s.composite_score,
-        }
-        for s in states
-    ]
-
-    return {
-        "student_count":        n,
-        "class_engagement":     round(avg_engagement * 100, 1),
-        "engaged_count":        sum(1 for s in states if s.is_engaged),
-        "yawn_rate":            round(yawn_rate * 100, 1),
-        "emotion_distribution": emotion_counts,
-        "faces":                faces_overlay,
-    }
+    crop = frame_bgr[y1:y2, x1:x2]
+    return crop if crop.size else None

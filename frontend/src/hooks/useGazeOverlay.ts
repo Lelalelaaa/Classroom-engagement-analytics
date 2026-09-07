@@ -1,30 +1,31 @@
 'use client';
 import { useEffect, useRef } from 'react';
+import { AttentionState, FaceOverlay } from '@/lib/types';
 
-interface FaceOverlay {
-  bbox:    [number, number, number, number]; // normalised x,y,w,h
-  yaw:     number;   // radians
-  pitch:   number;   // radians
-  emotion: string;
-  gaze:    string;
-  engaged: boolean;
-  score:   number;   // 0–1
-}
-
-const EMOTION_EMOJI: Record<string, string> = {
-  happiness: '😊', surprise: '😮', neutral: '😐',
-  sadness:   '😢', anger:   '😠', disgust: '🤢',
-  fear:      '😨', contempt:'😒',
+const STATE_COLORS: Record<AttentionState, string> = {
+  on_task:   '#4ade80',
+  desk_work: '#60a5fa',
+  off_task:  '#f87171',
+  unknown:   '#9ca3af',
 };
+
+const STATE_LABELS: Record<AttentionState, string> = {
+  on_task:   'On task',
+  desk_work: 'Desk work',
+  off_task:  'Off task',
+  unknown:   'Unknown',
+};
+
+const DEG = Math.PI / 180;
 
 function drawArrow(
   ctx: CanvasRenderingContext2D,
   cx: number, cy: number,
-  yaw: number, pitch: number,
+  yawDeg: number, pitchDeg: number,
   len: number, color: string,
 ) {
-  const ex = cx + Math.sin(yaw) * len;
-  const ey = cy + Math.sin(pitch) * len;
+  const ex = cx + Math.sin(yawDeg * DEG) * len;
+  const ey = cy + Math.sin(pitchDeg * DEG) * len;
 
   ctx.beginPath();
   ctx.moveTo(cx, cy);
@@ -45,16 +46,24 @@ function drawArrow(
   ctx.fill();
 }
 
+/**
+ * Draw face boxes and head-pose deviation arrows over the camera preview.
+ *
+ * `video` is passed as a value rather than a ref so the draw loop starts when
+ * the element is actually attached — a ref's identity never changes, so an
+ * effect keyed on one would run only on mount, before the camera exists.
+ */
 export function useGazeOverlay(
   canvasRef: React.RefObject<HTMLCanvasElement>,
-  videoRef:  React.RefObject<HTMLVideoElement>,
+  video:     HTMLVideoElement | null,
   faces:     FaceOverlay[],
 ) {
-  const animRef = useRef<number | null>(null);
+  const animRef  = useRef<number | null>(null);
+  const facesRef = useRef<FaceOverlay[]>(faces);
+  facesRef.current = faces;
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    const video  = videoRef.current;
     if (!canvas || !video) return;
 
     const ctx = canvas.getContext('2d');
@@ -72,7 +81,7 @@ export function useGazeOverlay(
       const W = canvas.width;
       const H = canvas.height;
 
-      faces.forEach((face) => {
+      facesRef.current.forEach((face) => {
         const [nx, ny, nw, nh] = face.bbox;
         const x  = nx * W;
         const y  = ny * H;
@@ -81,15 +90,14 @@ export function useGazeOverlay(
         const cx = x + bw / 2;
         const cy = y + bh / 2;
 
-        // Box color: green = engaged, red = not
-        const boxColor = face.engaged
-          ? 'rgba(74, 222, 128, 0.85)'   // green
-          : 'rgba(248, 113, 113, 0.85)'; // red
+        const color = STATE_COLORS[face.state] ?? STATE_COLORS.unknown;
 
         // ── Bounding box ──────────────────────────────────────────────────────
-        ctx.strokeStyle = boxColor;
+        ctx.strokeStyle = color;
         ctx.lineWidth   = 2;
+        ctx.setLineDash(face.measured ? [] : [5, 4]);
         ctx.strokeRect(x, y, bw, bh);
+        ctx.setLineDash([]);
 
         // Corner accents
         const clen = 12;
@@ -107,21 +115,21 @@ export function useGazeOverlay(
           }
         );
 
-        // ── Gaze arrow ────────────────────────────────────────────────────────
-        const arrowColor = face.engaged ? '#4ade80' : '#f87171';
-        drawArrow(ctx, cx, cy, face.yaw, face.pitch, Math.min(bw, bh) * 0.6, arrowColor);
+        // ── Deviation arrow ───────────────────────────────────────────────────
+        drawArrow(ctx, cx, cy, face.yaw, face.pitch, Math.min(bw, bh) * 0.6, color);
 
         // ── Labels ────────────────────────────────────────────────────────────
-        const emoji    = EMOTION_EMOJI[face.emotion] ?? '😐';
-        const scoreStr = `${Math.round(face.score * 100)}%`;
-        const label    = `${emoji} ${scoreStr}`;
+        const ratioStr = face.on_task_ratio === null
+          ? '—'
+          : `${Math.round(face.on_task_ratio * 100)}%`;
+        const label = `${STATE_LABELS[face.state] ?? face.state} ${ratioStr}${face.has_gaze ? ' 👁' : ''}`;
 
         // Label background
         ctx.font       = 'bold 13px Inter, system-ui, sans-serif';
         const tw       = ctx.measureText(label).width + 10;
         const lx       = x;
         const ly       = y - 24;
-        ctx.fillStyle  = face.engaged ? 'rgba(0,0,0,0.6)' : 'rgba(80,0,0,0.7)';
+        ctx.fillStyle  = 'rgba(0,0,0,0.6)';
         ctx.beginPath();
         ctx.roundRect(lx, ly, tw, 20, 4);
         ctx.fill();
@@ -129,13 +137,15 @@ export function useGazeOverlay(
         ctx.fillStyle  = '#ffffff';
         ctx.fillText(label, lx + 5, ly + 14);
 
-        // Engagement score bar at bottom of face box
-        const barH  = 4;
-        const barY  = y + bh + 4;
-        ctx.fillStyle = 'rgba(255,255,255,0.15)';
-        ctx.fillRect(x, barY, bw, barH);
-        ctx.fillStyle = arrowColor;
-        ctx.fillRect(x, barY, bw * face.score, barH);
+        // On-task ratio bar at bottom of face box
+        if (face.on_task_ratio !== null) {
+          const barH  = 4;
+          const barY  = y + bh + 4;
+          ctx.fillStyle = 'rgba(255,255,255,0.15)';
+          ctx.fillRect(x, barY, bw, barH);
+          ctx.fillStyle = color;
+          ctx.fillRect(x, barY, bw * face.on_task_ratio, barH);
+        }
       });
 
       animRef.current = requestAnimationFrame(draw);
@@ -145,5 +155,5 @@ export function useGazeOverlay(
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
-  }, [canvasRef, videoRef, faces]);
+  }, [canvasRef, video]);
 }

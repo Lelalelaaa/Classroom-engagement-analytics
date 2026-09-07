@@ -1,9 +1,22 @@
 """
-MediaPipe FaceLandmarker using the new Tasks API (mediapipe >= 0.10).
-Wraps the new result format to stay compatible with the rest of the pipeline.
-Auto-downloads the face_landmarker.task model on first run (~6 MB).
+MediaPipe FaceLandmarker (Tasks API, mediapipe >= 0.10).
+Auto-downloads face_landmarker.task on first run (~6 MB).
+
+Two modes, both needed:
+
+  process_crop()  — the live path. YuNet finds the faces on the full frame and
+                    this runs on each crop, where the face fills the input and
+                    the landmarker's short-range detector is inside its
+                    comfortable range.
+  process_frame() — full-frame, multi-face. Kept so the eval harness can
+                    measure landmarker-alone recall against YuNet+crop and
+                    settle the architecture on numbers rather than assumption.
+
+Both request `output_facial_transformation_matrixes`, which is what makes head
+pose available at zero extra inference cost (see head_pose.pose_from_matrix).
 """
 import os
+import queue
 import urllib.request
 import numpy as np
 import cv2
@@ -24,8 +37,6 @@ def _ensure_model() -> None:
         print("[mediapipe] Model downloaded and ready.")
 
 
-# ── Compatibility wrappers so gaze/yawn estimators don't need changes ─────────
-
 class _LandmarkCompat:
     """Makes a single NormalizedLandmark accessible as .x .y .z"""
     __slots__ = ("x", "y", "z")
@@ -43,41 +54,62 @@ class _FaceLandmarksCompat:
 
 
 class _ResultCompat:
-    """Makes new Tasks result look like old mp.solutions result."""
+    """Adapts the Tasks API result to the shape the rest of the pipeline reads."""
     def __init__(self, task_result):
         if task_result.face_landmarks:
             self.multi_face_landmarks = [
-                _FaceLandmarksCompat(lm_list)
-                for lm_list in task_result.face_landmarks
+                _FaceLandmarksCompat(lm_list) for lm_list in task_result.face_landmarks
             ]
         else:
             self.multi_face_landmarks = None
 
+        self.facial_transformation_matrixes = list(
+            getattr(task_result, "facial_transformation_matrixes", None) or []
+        )
 
-# ── Main pipeline class ───────────────────────────────────────────────────────
+    @property
+    def face_count(self) -> int:
+        return len(self.multi_face_landmarks or [])
+
 
 class FacePipelineConfig:
-    """
-    Shared FaceLandmarker instance reused across all frames.
-    Compatible with mediapipe >= 0.10 (Tasks API).
-    """
+    """Shared FaceLandmarker instances reused across all frames."""
 
-    def __init__(self, max_faces: int = 35):
+    def __init__(self, max_faces: int = 40, crop_pool_size: int = 4):
         _ensure_model()
-        base_options = mp.tasks.BaseOptions(model_asset_path=MODEL_PATH)
+        self._landmarker = self._build(max_faces)
+        # A FaceLandmarker cannot serve concurrent detect() calls, so the
+        # worker pool borrows one instance each rather than sharing one.
+        self._crop_pool: queue.Queue = queue.Queue()
+        for _ in range(max(1, crop_pool_size)):
+            self._crop_pool.put(self._build(1))
+        print(f"[mediapipe] FaceLandmarker ready (max_faces={max_faces}, "
+              f"crop_pool={crop_pool_size}, +transform matrices)")
+
+    @staticmethod
+    def _build(num_faces: int):
         options = mp_vision.FaceLandmarkerOptions(
-            base_options=base_options,
-            num_faces=max_faces,
+            base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+            num_faces=num_faces,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
+            output_facial_transformation_matrixes=True,
         )
-        self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
-        print(f"[mediapipe] FaceLandmarker ready (max_faces={max_faces})")
+        return mp_vision.FaceLandmarker.create_from_options(options)
 
     def process_frame(self, frame_bgr: np.ndarray) -> _ResultCompat:
-        """Run face landmark detection and return a compatibility-wrapped result."""
-        rgb    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = self._landmarker.detect(mp_img)
-        return _ResultCompat(result)
+        return _ResultCompat(self._landmarker.detect(_to_mp_image(frame_bgr)))
+
+    def process_crop(self, crop_bgr: np.ndarray) -> _ResultCompat:
+        """Landmark a single pre-detected face crop. Safe to call from any worker."""
+        landmarker = self._crop_pool.get()
+        try:
+            return _ResultCompat(landmarker.detect(_to_mp_image(crop_bgr)))
+        finally:
+            self._crop_pool.put(landmarker)
+
+
+def _to_mp_image(frame_bgr: np.ndarray) -> "mp.Image":
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    return mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))

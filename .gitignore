@@ -28,3 +28,14 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Model weights (downloaded, not vendored)
+backend/models/**/*.onnx
+backend/app/pipeline/weights/*.onnx
+backend/app/pipeline/*.task
+
+# Consented classroom recordings — offline validation only, never committed
+backend/recordings/
+backend/annotations/
+backend/eval/out/
+backend/eval/ratings/

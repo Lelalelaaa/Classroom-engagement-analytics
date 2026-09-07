@@ -5,15 +5,15 @@ import { useSessionControls }  from '@/hooks/useSessionControls';
 import { useEngagementStore }  from '@/store/engagementStore';
 import { useGazeOverlay }      from '@/hooks/useGazeOverlay';
 import { EngagementGauge }     from '@/components/charts/EngagementGauge';
-import { EmotionPulse }        from '@/components/charts/EmotionPulse';
+import { AttentionBreakdown }  from '@/components/charts/AttentionBreakdown';
 import { TimelineLine }        from '@/components/charts/TimelineLine';
 import { AlertBanner }         from '@/components/ui/AlertBanner';
 import { KPICard }             from '@/components/ui/KPICard';
 import { SessionSetup }        from '@/components/ui/SessionSetup';
-import { LiveMetrics, FaceOverlay } from '@/lib/types';
+import { LiveMetrics, FaceOverlay, AttentionState } from '@/lib/types';
 import { CameraClient }        from '@/lib/cameraClient';
 import Link from 'next/link';
-import { ArrowLeft, Zap, Camera, CameraOff } from 'lucide-react';
+import { ArrowLeft, Zap, Camera, CameraOff, Crosshair } from 'lucide-react';
 
 const WS_BASE = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
 
@@ -23,30 +23,45 @@ function makeDemoMetrics(tick: number): LiveMetrics {
   const eng   = Math.max(20, Math.min(98, base));
   const total = 6;
   const engCt = Math.round(total * eng / 100);
-  const yawn  = Math.max(0, Math.min(30, 8 + Math.sin(tick / 5) * 6 + (Math.random() - 0.5) * 4));
 
   // Fake face overlays for demo
   const faces: FaceOverlay[] = Array.from({ length: total }, (_, i) => {
-    const col  = i % 3;
-    const row  = Math.floor(i / 3);
-    const isEn = i < engCt;
+    const col   = i % 3;
+    const row   = Math.floor(i / 3);
+    const isEn  = i < engCt;
+    const state: AttentionState = isEn
+      ? (i % 4 === 3 ? 'desk_work' : 'on_task')
+      : (i === total - 1 ? 'unknown' : 'off_task');
     return {
-      bbox:    [0.08 + col * 0.3, 0.15 + row * 0.45, 0.22, 0.32],
-      yaw:     isEn ? (Math.random() - 0.5) * 0.2 : (Math.random() - 0.5) * 1.2,
-      pitch:   isEn ? (Math.random() - 0.5) * 0.1 : (Math.random() - 0.5) * 0.6,
-      emotion: isEn ? ['happiness', 'neutral', 'surprise'][i % 3] : ['sadness', 'anger', 'neutral'][i % 3],
-      gaze:    isEn ? '👀 Looking Forward' : '→ Looking Right',
-      engaged: isEn,
-      score:   isEn ? 0.6 + Math.random() * 0.35 : 0.1 + Math.random() * 0.35,
+      bbox:          [0.08 + col * 0.3, 0.15 + row * 0.45, 0.22, 0.32],
+      yaw:           isEn ? (Math.random() - 0.5) * 12 : (Math.random() - 0.5) * 70,
+      pitch:         isEn ? (Math.random() - 0.5) * 8  : (Math.random() - 0.5) * 40,
+      state,
+      on_task_ratio: state === 'unknown' ? null : (isEn ? 0.6 + Math.random() * 0.35 : 0.1 + Math.random() * 0.35),
+      measured:      state !== 'unknown',
+      has_gaze:      row === 0,
     };
   });
 
+  const stateCounts = faces.reduce<Record<AttentionState, number>>(
+    (acc, f) => ({ ...acc, [f.state]: acc[f.state] + 1 }),
+    { on_task: 0, desk_work: 0, off_task: 0, unknown: 0 },
+  );
+  const tracked = faces.filter((f) => f.measured).length;
+
   return {
-    session_id: 'demo', student_count: total,
+    session_id: 'demo',
+    on_task_ratio: parseFloat((eng / 100).toFixed(4)),
     class_engagement: parseFloat(eng.toFixed(1)),
+    student_count: total,
+    tracked_count: tracked,
+    detected_count: total,
+    expected_count: null,
     engaged_count: engCt,
-    yawn_rate: parseFloat(yawn.toFixed(1)),
-    emotion_distribution: { happiness: engCt, neutral: Math.round(total * 0.2), sadness: total - engCt },
+    below_floor_count: tracked - engCt,
+    state_counts: stateCounts,
+    is_calibrating: false,
+    gaze_model_loaded: true,
     faces,
     timestamp: Date.now(),
   };
@@ -59,13 +74,13 @@ export default function TeacherDashboard() {
   const [showSetup, setShowSetup]       = useState(!sessionId);
   const [demoMode, setDemoMode]         = useState(false);
   const [demoMetrics, setDemoMetrics]   = useState<LiveMetrics | null>(null);
-  const [demoHistory, setDemoHistory]   = useState<{ time: string; engagement: number }[]>([]);
+  const [demoHistory, setDemoHistory]   = useState<LiveMetrics[]>([]);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError]   = useState<string | null>(null);
+  const [videoEl, setVideoEl]           = useState<HTMLVideoElement | null>(null);
 
   const tickRef      = useRef(0);
   const cameraRef    = useRef<CameraClient | null>(null);
-  const videoRef     = useRef<HTMLVideoElement | null>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const videoContRef = useRef<HTMLDivElement>(null);
 
@@ -78,7 +93,7 @@ export default function TeacherDashboard() {
   useEngagementSocket(sessionId);
 
   // Wire the gaze overlay canvas
-  useGazeOverlay(canvasRef, videoRef as React.RefObject<HTMLVideoElement>, currentFaces);
+  useGazeOverlay(canvasRef, videoEl, currentFaces);
 
   // ── Demo simulator ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -87,9 +102,7 @@ export default function TeacherDashboard() {
       tickRef.current += 1;
       const m = makeDemoMetrics(tickRef.current);
       setDemoMetrics(m);
-      setDemoHistory(prev =>
-        [...prev, { time: new Date().toLocaleTimeString('en-US', { hour12: false }), engagement: m.class_engagement }].slice(-40)
-      );
+      setDemoHistory(prev => [...prev, m].slice(-40));
     }, 1500);
     return () => clearInterval(id);
   }, [demoMode]);
@@ -100,10 +113,10 @@ export default function TeacherDashboard() {
     try {
       const client = new CameraClient(sid, WS_BASE);
       cameraRef.current = client;
-      await client.start(5);
+      await client.start();
       const videoEl        = client.getVideoElement();
       videoEl.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:12px;';
-      videoRef.current = videoEl;
+      setVideoEl(videoEl);
       if (videoContRef.current) {
         videoContRef.current.innerHTML = '';
         videoContRef.current.appendChild(videoEl);
@@ -119,8 +132,11 @@ export default function TeacherDashboard() {
     cameraRef.current?.stop();
     cameraRef.current = null;
     setCameraActive(false);
+    setVideoEl(null);
     if (videoContRef.current) videoContRef.current.innerHTML = '';
   }, []);
+
+  const calibrate = useCallback(() => cameraRef.current?.calibrate(), []);
 
   // ── Session handlers ────────────────────────────────────────────────────
   const handleStart = async (classroomId: string, teacher: string, subject: string) => {
@@ -170,6 +186,16 @@ export default function TeacherDashboard() {
               {cameraActive ? 'Camera + AI active' : 'No camera'}
             </span>
           )}
+          {!demoMode && (
+            <button
+              onClick={calibrate}
+              disabled={!cameraActive}
+              className="flex items-center gap-1.5 px-4 py-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 disabled:opacity-40 disabled:hover:bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 rounded-lg text-sm font-medium transition-colors"
+            >
+              <Crosshair className="w-3.5 h-3.5" />
+              Calibrate
+            </button>
+          )}
           <button onClick={handleEnd} className="px-4 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 rounded-lg text-sm font-medium transition-colors">
             End Session
           </button>
@@ -183,6 +209,19 @@ export default function TeacherDashboard() {
           <div className="flex items-center gap-3 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3 text-red-400 text-sm">
             <CameraOff className="w-4 h-4 shrink-0" />
             {cameraError}
+          </div>
+        )}
+
+        {liveMetrics?.is_calibrating && (
+          <div className="flex items-center gap-3 bg-indigo-500/10 border border-indigo-500/20 rounded-xl px-4 py-3 text-indigo-300 text-sm">
+            <Crosshair className="w-4 h-4 shrink-0 animate-pulse" />
+            Calibrating — ask everyone to look at the board until this clears.
+          </div>
+        )}
+
+        {liveMetrics && !liveMetrics.gaze_model_loaded && (
+          <div className="flex items-center gap-3 bg-yellow-500/10 border border-yellow-500/20 rounded-xl px-4 py-3 text-yellow-300 text-sm">
+            Eye-gaze model not loaded — running on head pose alone.
           </div>
         )}
 
@@ -232,16 +271,19 @@ export default function TeacherDashboard() {
             {/* Gaze legend */}
             {(cameraActive || demoMode) && currentFaces.length > 0 && (
               <div className="absolute bottom-3 right-3 z-20 flex flex-col gap-1">
+                {([
+                  ['bg-green-400', 'On task'],
+                  ['bg-blue-400',  'Desk work'],
+                  ['bg-red-400',   'Off task'],
+                  ['bg-gray-400',  'Unknown (not scored)'],
+                ] as const).map(([dot, label]) => (
+                  <div key={label} className="flex items-center gap-1.5 bg-gray-950/70 backdrop-blur px-2 py-1 rounded-md">
+                    <span className={`w-2 h-2 rounded-full ${dot}`} />
+                    <span className="text-[10px] text-gray-300">{label}</span>
+                  </div>
+                ))}
                 <div className="flex items-center gap-1.5 bg-gray-950/70 backdrop-blur px-2 py-1 rounded-md">
-                  <span className="w-2 h-2 rounded-full bg-green-400" />
-                  <span className="text-[10px] text-gray-300">Engaged</span>
-                </div>
-                <div className="flex items-center gap-1.5 bg-gray-950/70 backdrop-blur px-2 py-1 rounded-md">
-                  <span className="w-2 h-2 rounded-full bg-red-400" />
-                  <span className="text-[10px] text-gray-300">Disengaged</span>
-                </div>
-                <div className="flex items-center gap-1.5 bg-gray-950/70 backdrop-blur px-2 py-1 rounded-md">
-                  <span className="text-[10px] text-gray-300">→ Arrow = Gaze direction</span>
+                  <span className="text-[10px] text-gray-300">→ Arrow = deviation from reference</span>
                 </div>
               </div>
             )}
@@ -249,9 +291,9 @@ export default function TeacherDashboard() {
 
           {/* KPI Cards */}
           <div className="lg:col-span-2 grid grid-cols-2 gap-4 content-start">
-            <KPICard label="Students Detected"  value={liveMetrics?.student_count ?? '—'} />
-            <KPICard label="Engaged Students"   value={liveMetrics ? `${liveMetrics.engaged_count}/${liveMetrics.student_count}` : '—'} accent="green" />
-            <KPICard label="Yawn Rate"          value={liveMetrics ? `${liveMetrics.yawn_rate.toFixed(0)}%` : '—'} accent="yellow" />
+            <KPICard label="Students Detected"  value={liveMetrics?.detected_count ?? '—'} />
+            <KPICard label="Engaged Students"   value={liveMetrics ? `${liveMetrics.engaged_count}/${liveMetrics.tracked_count}` : '—'} accent="green" />
+            <KPICard label="Tracked / Detected" value={liveMetrics ? `${liveMetrics.tracked_count}/${liveMetrics.student_count}` : '—'} accent="yellow" />
             <KPICard label="Class Engagement"   value={liveMetrics ? `${liveMetrics.class_engagement.toFixed(0)}%` : '—'} accent="indigo" />
           </div>
         </div>
@@ -263,8 +305,8 @@ export default function TeacherDashboard() {
             <EngagementGauge value={liveMetrics?.class_engagement ?? 0} />
           </div>
           <div className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
-            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Emotional Pulse</h2>
-            <EmotionPulse distribution={liveMetrics?.emotion_distribution} />
+            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Attention Breakdown</h2>
+            <AttentionBreakdown counts={liveMetrics?.state_counts} />
           </div>
           <div className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Engagement Timeline</h2>
